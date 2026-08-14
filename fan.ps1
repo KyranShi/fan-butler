@@ -113,16 +113,16 @@ function Parse-SensorRecord {
         }
     }
     if (-not $name) { return $null }
-    $m = [int]($d[24] -bor ($d[25] -shl 8))
-    $b = [int]($d[26] -bor ($d[27] -shl 8))
+    $m = [int]($d[26] -bor ($d[27] -shl 8))
+    $b = [int]($d[28] -bor ($d[29] -shl 8))
     return [pscustomobject]@{
         Number  = [int]$d[9]
         Name    = $name
         TypeCode = [int]$d[14]          # 0x01温度 0x02电压 0x04风扇 ...
         ReadingType = [int]$d[15]       # 0x01模拟量 0x6F离散量
-        Unit    = [int]$d[21]
+        Unit    = [int]$d[23]
         M = $m; B = $b
-        Rexp = (ConvertTo-SignedNibble ($d[29] -shr 4)); Bexp = (ConvertTo-SignedNibble ($d[29] -band 0xF))
+        Rexp = (ConvertTo-SignedNibble ($d[31] -shr 4)); Bexp = (ConvertTo-SignedNibble ($d[31] -band 0xF))
     }
 }
 
