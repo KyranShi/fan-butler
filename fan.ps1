@@ -1,52 +1,48 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
-Fan Butler — 超微主板风扇管家 (v0: 只读版)
-==========================================
-用途: 显示 Supermicro 主板的风扇转速与温度 (走 Windows 自带 IPMI 驱动,
+Fan Butler — 超微主板风扇管家 (v0.9: 只读版, 已实测校准)
+==========================================================
+用途: 显示 Supermicro X12DAi-N6 的风扇转速与温度 (走 Windows 自带 IPMI 驱动,
       不需要安装任何软件, 不需要 BMC 账号密码)
 
 用法:
   pwsh -NoProfile -File fan.ps1            # 显示状态
   pwsh -NoProfile -File fan.ps1 status      # 同上
 
-背景知识:
-  - BMC 是主板上的独立小电脑, 风扇归它管
-  - IPMI 是和 BMC 对话的标准协议; 我们通过 Windows 系统自带的
-    "Microsoft Generic IPMI Compliant Device" 驱动 (WMI: root\WMI\Microsoft_IPMI)
-    直接向 BMC 发送原始命令 (raw command)
-  - v0 只读不写: 只调 GetDeviceID / SDR 读取 / GetSensorReading,
-    不会改变风扇任何状态, 随时可按 Ctrl+C 中断
+实测校准笔记 (X12DAi-N6 / BMC 3.1 / IPMI 2.0, 2026-08):
+  - 传输: root\WMI\Microsoft_IPMI 的 RequestResponse 方法, NetFn 原样传入;
+          ResponseData 首字节是完成码回显, 真实负载从第 2 字节开始
+  - SDR 枚举: 记录 ID 从 0x0004 起等差 +0x43, 共 53 条 (链表指针的高字节
+          不可靠, 直接按步长盲扫最稳)
+  - GetSDR 响应: [下一条ID(2字节)][记录本体]
+  - 记录本体布局 (字节序号从 0 起, 与 IPMI 规范略有出入, 全部实测验证):
+      [3] 记录类型 (0x01=Full传感器)
+      [7] 传感器编号
+      [12] 传感器类型 (0x01温度 0x02电压 0x04风扇 0x29电池...)
+      [13] 读数类型 (0x01模拟量 0x6F离散量)
+      [21] 基本单位 (0x01=°C 0x04=V 0x12=RPM)
+      [24..25] M 系数 (16位无符号小端)
+      [26..27] B 系数 (16位无符号小端)
+      [29] 高4位=Rexp 低4位=Bexp (有符号)
+      [47] 名字长度码 (0xC0|长度)
+      [48..] 名字 (ASCII)
+  - 换算公式: 工程值 = (M × 原始读数 + B × 10^Bexp) × 10^Rexp
+      验证: 12V轨 原始142 M=83 B=48 → (142×83+48)/1000 = 11.83V ✓
+            CPU温度 原始40 M=1 → 40°C ✓
+            风扇 原始11 M=140 → 1540 RPM ✓
+  - 读数 flags 字节恒为 0xC0 (不可信, 忽略)
+  - 风扇模式查询: raw 0x30 0x45 0x00 → 0=Standard 1=Full 2=Optimal
 
-SDR 解析备忘 (GetSDR 返回布局, 修正版):
-  Data[0..1] = 下一条记录 ID
-  Data[2..]  = SDR 记录本体:
-    记录[0..1] ID / [2] 版本0x51 / [3] 类型 / [4] 本体长度
-    记录[7]  传感器编号      → Data[9]
-    记录[12] 传感器类型      → Data[14]   (0x01=温度 0x04=风扇)
-    记录[13] 读数类型        → Data[15]
-    —— 仅 Full 记录 (类型 0x01):
-    记录[24] 单元/模拟标志   → Data[26]   (高2位: 模拟量格式)
-    记录[26] 基本单位        → Data[28]   (1=°C 18=RPM)
-    记录[27] 线性化          → Data[29]
-    记录[28..29] M 系数      → Data[30..31] (10位有符号)
-    记录[30..31] B 系数      → Data[32..33] (10位有符号)
-    记录[34] Rexp/Bexp       → Data[36]   (高低各4位有符号)
-    记录[48] 名字长度        → Data[50]
-    记录[49..] 名字          → Data[51..]
-  换算: y = (M*x + B) * 10^Rexp
+v0.9 只读不写, 不会改变风扇任何状态。
 #>
 param([string]$Command = 'status')
 $ErrorActionPreference = 'Stop'
 
 # ============================================================
-# 一、IPMI 传输层
-#    自动探测: 方法名(RequestResponse/RequestResponseEx) x
-#              NetFn 编码(原样/左移2位), 探测成功后缓存
+# 一、IPMI 传输层 (已校准: RequestResponse / NetFn原样 / 剥完成码回显)
 # ============================================================
-$script:Device      = $null
-$script:Method      = $null    # 'RequestResponse' | 'RequestResponseEx'
-$script:NetFnShift  = $null    # 0 = 原样传入, 2 = 左移两位
-$script:Responder   = 0x20     # BMC 在 IPMB 总线上的地址, 固定 0x20
+$script:Device    = $null
+$script:Responder = 0x20
 
 function Get-IpmiDevice {
     if ($script:Device) { return $script:Device }
@@ -57,289 +53,176 @@ function Get-IpmiDevice {
     return $d
 }
 
-function Invoke-IpmiMethod {
-    param([string]$M, [int]$Nf, [byte]$Cmd, [byte[]]$Data)
-    if ($M -eq 'RequestResponse') {
-        $a = @{ NetworkFunction = [byte]$Nf; Command = $Cmd; Lun = [byte]0
-                ResponderAddress = [byte]$script:Responder
-                RequestData = [byte[]]$Data; RequestDataSize = [uint32]$Data.Length }
-    } else {
-        $a = @{ NetworkFunction = [byte]$Nf; Command = $Cmd; Lun = [byte]0
-                ResponderAddress = [byte]$script:Responder
-                Data = [byte[]]$Data; DataSize = [uint32]$Data.Length
-                RequestDataSize = [uint32]$Data.Length }
-    }
-    return Invoke-CimMethod -InputObject (Get-IpmiDevice) -MethodName $M -Arguments $a
-}
-
-# 探测通道: 先用无数据的 GetDeviceID 试四种组合,
-#          再用带 1 字节数据的"读风扇模式"(0x30 0x45 0x00, 只读无害)兜底
-function Initialize-IpmiTransport {
-    $dev = Get-IpmiDevice
-    $attempts = @()
-    foreach ($m in 'RequestResponse', 'RequestResponseEx') {
-        foreach ($shift in 0, 2) {
-            $nf = if ($shift -eq 2) { (0x06 -shl 2) -band 0xFF } else { 0x06 }
-            try {
-                $r = Invoke-IpmiMethod $m $nf 0x01 @()
-                $cc = [int]$r.CompletionCode
-                $d  = [byte[]]$r.ResponseData
-                if ($cc -eq 0 -and $d -and $d.Length -ge 4 -and $d[0] -eq 0x20) {
-                    $script:Method = $m; $script:NetFnShift = $shift
-                    Write-Host ("[通道] {0} / NetFn{1}" -f $m, $(if ($shift -eq 0) { '(原样)' } else { '(左移2位)' }))
-                    return
-                }
-                $attempts += ("{0} shift={1}: CC=0x{2:X2} len={3}" -f $m, $shift, $cc, $d.Length)
-            } catch { $attempts += ("{0} shift={1}: {2}" -f $m, $shift, $_.Exception.Message) }
-        }
-    }
-    # 兜底: 带 1 字节数据的只读命令 (排除"空数组参数不兼容"的情况)
-    foreach ($m in 'RequestResponse', 'RequestResponseEx') {
-        foreach ($shift in 0, 2) {
-            $nf = if ($shift -eq 2) { (0x30 -shl 2) -band 0xFF } else { 0x30 }
-            try {
-                $r = Invoke-IpmiMethod $m $nf 0x45 @([byte]0x00)
-                if ([int]$r.CompletionCode -eq 0) {
-                    $script:Method = $m; $script:NetFnShift = $shift
-                    Write-Host ("[通道] {0} / NetFn{1} (带数据命令验证)" -f $m, $(if ($shift -eq 0) { '(原样)' } else { '(左移2位)' }))
-                    return
-                }
-            } catch {}
-        }
-    }
-    throw ("IPMI 通道探测失败, 全部尝试结果:`n  " + ($attempts -join "`n  "))
-}
-
-# 发送一条原始 IPMI 命令, 返回 { CompletionCode, Data }
 function Invoke-IpmiRaw {
     param([byte]$NetFn, [byte]$Cmd, [byte[]]$Data = @())
-    if ($null -eq $script:Method) { Initialize-IpmiTransport }
-    $nf = if ($script:NetFnShift -eq 2) { ($NetFn -shl 2) -band 0xFF } else { $NetFn }
-    $r = Invoke-IpmiMethod $script:Method $nf $Cmd $Data
+    $a = @{ NetworkFunction = $NetFn; Command = $Cmd; Lun = [byte]0
+            ResponderAddress = [byte]$script:Responder
+            RequestData = [byte[]]$Data; RequestDataSize = [uint32]$Data.Length }
+    $r = Invoke-CimMethod -InputObject (Get-IpmiDevice) -MethodName RequestResponse -Arguments $a
     $rd = [byte[]]$r.ResponseData
     if (-not $rd) { $rd = [byte[]]@() }
+    if ($rd.Count -ge 2) { $rd = [byte[]]($rd[1..($rd.Count-1)]) }   # 剥掉完成码回显
+    elseif ($rd.Count -eq 1) { $rd = [byte[]]@() }
     return [pscustomobject]@{ CompletionCode = [int]$r.CompletionCode; Data = $rd }
 }
 
 # ============================================================
-# 二、传感器枚举 (SDR: Sensor Data Record 仓库)
+# 二、SDR 传感器枚举 (等差步长扫描, 实测 53 条)
 # ============================================================
+$script:SdrResv = $null
 
-function Get-SdrReservation {
-    $r = Invoke-IpmiRaw 0x0A 0x22            # Reserve SDR Repository
-    if ($r.CompletionCode -ne 0 -or $r.Data.Length -lt 2) {
+function Update-SdrReservation {
+    $r = Invoke-IpmiRaw 0x0A 0x22
+    if ($r.CompletionCode -ne 0 -or $r.Data.Count -lt 2) {
         throw ("预留 SDR 仓库失败 CC=0x{0:X2}" -f $r.CompletionCode)
     }
-    return [int]($r.Data[0] -bor ($r.Data[1] -shl 8))
+    $script:SdrResv = [byte[]]@($r.Data[0], $r.Data[1])
 }
 
-# 读取一条 SDR 记录: 先读 7 字节 (nextId 2 + 记录头 5) 拿本体长度,
-#                  再整条读回; 预约丢失 (0xC5) 自动重预约重试
-function Read-SdrRecord {
-    param([ref]$Reservation, [int]$RecordId)
-    for ($attempt = 0; $attempt -lt 3; $attempt++) {
-        $res = $Reservation.Value
-        $resLo = [byte]($res -band 0xFF); $resHi = [byte](($res -shr 8) -band 0xFF)
-        $idLo = [byte]($RecordId -band 0xFF); $idHi = [byte](($RecordId -shr 8) -band 0xFF)
-        $h = Invoke-IpmiRaw 0x0A 0x23 @($resLo, $resHi, $idLo, $idHi, [byte]0, [byte]7)
-        if ($h.CompletionCode -eq 0xC5) { $Reservation.Value = Get-SdrReservation; continue }
-        if ($h.CompletionCode -ne 0 -or $h.Data.Length -lt 7) { return $null }
-        $bodyLen = [int]$h.Data[6]
-        $total = 5 + $bodyLen                    # 记录本体长度 (不含 nextId 前缀)
-        if ($total -gt 0xE0) { $total = 0xE0 }   # 单次读取上限 224 字节
-        $g = Invoke-IpmiRaw 0x0A 0x23 @($resLo, $resHi, $idLo, $idHi, [byte]0, [byte]$total)
-        if ($g.CompletionCode -eq 0xC5) { $Reservation.Value = Get-SdrReservation; continue }
-        if ($g.CompletionCode -ne 0) {
-            # 整条读失败时退回 7 字节头, 让遍历能靠 nextId 继续
-            return ,([byte[]]$h.Data)
-        }
-        return ,([byte[]]$g.Data)
-    }
-    return $null
+function Read-SdrById {
+    param([int]$Id)
+    if ($null -eq $script:SdrResv) { Update-SdrReservation }
+    $lo = [byte]($Id -band 0xFF); $hi = [byte](($Id -shr 8) -band 0xFF)
+    $h = Invoke-IpmiRaw 0x0A 0x23 @($script:SdrResv[0], $script:SdrResv[1], $lo, $hi, [byte]0, [byte]7)
+    if ($h.CompletionCode -eq 0xC5) { Update-SdrReservation; $h = Invoke-IpmiRaw 0x0A 0x23 @($script:SdrResv[0], $script:SdrResv[1], $lo, $hi, [byte]0, [byte]7) }
+    if ($h.CompletionCode -ne 0 -or $h.Data.Count -lt 7) { return $null }
+    $bodyLen = [int]$h.Data[6]
+    $total = [Math]::Min(5 + $bodyLen, 0xE0)
+    $g = Invoke-IpmiRaw 0x0A 0x23 @($script:SdrResv[0], $script:SdrResv[1], $lo, $hi, [byte]0, [byte]$total)
+    if ($g.CompletionCode -eq 0xC5) { Update-SdrReservation; $g = Invoke-IpmiRaw 0x0A 0x23 @($script:SdrResv[0], $script:SdrResv[1], $lo, $hi, [byte]0, [byte]$total) }
+    if ($g.CompletionCode -ne 0) { return ,([byte[]]$h.Data) }
+    return ,([byte[]]$g.Data)
 }
 
-# 10 位有符号整数解码 (M/B 系数的压缩格式)
-function ConvertTo-Signed10 { param([int]$Lo, [int]$HiBits)
-    $v = $Lo -bor ($HiBits -shl 8)
-    if ($v -band 0x200) { $v -= 0x400 }
-    return $v
-}
-function ConvertTo-SignedNibble { param([int]$Nib)
-    if ($Nib -gt 7) { return $Nib - 16 } else { return $Nib }
-}
+function ConvertTo-SignedNibble { param([int]$Nib) if ($Nib -gt 7) { $Nib - 16 } else { $Nib } }
 
-# 从记录尾部回扫可打印 ASCII 串作为名字 (Supermicro 名字都是 ASCII, 长度字节=0xC0|len)
-function Get-NameFromTail { param([byte[]]$d, [int]$start, [int]$endExclusive)
-    $runEnd = $endExclusive
-    while ($runEnd -gt $start -and $d[$runEnd-1] -ge 0x20 -and $d[$runEnd-1] -le 0x7E) { $runEnd-- }
-    $runLen = $endExclusive - $runEnd
-    if ($runLen -ge 2 -and $runEnd -gt $start) {
-        if (($d[$runEnd-1] -band 0x3F) -eq $runLen) {
-            return [Text.Encoding]::ASCII.GetString($d, $runEnd, $runLen).Trim()
-        }
-    }
-    return $null
-}
-
-function Test-Printable { param([string]$s)
-    return ($s -and ($s -replace '[\x20-\x7E]', '').Length -eq 0)
-}
-
-# 解析传感器记录 → 结构化对象
-#   0x01 = Full (模拟量, 带换算系数)  0x02 = Compact (离散量)
+# 解析一条传感器记录 (布局见文件头校准笔记)
 function Parse-SensorRecord {
-    param([byte[]]$d)
-    if ($d.Length -lt 7) { return $null }
-    $nextId  = [int]($d[0] -bor ($d[1] -shl 8))
+    param([byte[]]$d)     # d = GetSDR 响应负载: [nextId(2)][记录]
+    if ($d.Count -lt 48) { return $null }
     $recType = [int]$d[5]
+    if ($recType -ne 0x01) { return $null }        # 只处理 Full 传感器记录
     $bodyLen = [int]$d[6]
-    $recEnd  = [Math]::Min($d.Length, 7 + $bodyLen)   # 记录本体在 Data 中的结束位置
-
-    if ($recType -eq 0x01) {                                   # Full Sensor Record
-        if ($d.Length -lt 51) {
-            return [pscustomobject]@{ Kind = 'other'; NextId = $nextId }
+    $recEnd  = [Math]::Min($d.Count, 7 + $bodyLen)
+    # 名字: 长度码在记录[47]→d[49], 名字在记录[48]→d[50]
+    $name = $null
+    if ($recEnd -gt 50) {
+        $idLen = [int]($d[49] -band 0x1F)
+        if ($idLen -gt 0 -and (50 + $idLen) -le $recEnd) {
+            $name = [Text.Encoding]::ASCII.GetString($d, 50, $idLen).Trim([char]0, ' ')
         }
-        $name = $null
-        $idLen = $d[50] -band 0x1F
-        if ($idLen -gt 0 -and (51 + $idLen) -le $recEnd) {
-            $name = [Text.Encoding]::ASCII.GetString($d, 51, $idLen).Trim([char]0, ' ')
-        }
-        if (-not (Test-Printable $name)) { $name = Get-NameFromTail $d 7 $recEnd }
-        if (-not $name) { $name = "Sensor#$($d[9])" }
-        $analog = ($d[26] -shr 6) -band 3      # 0-2=模拟量格式, 3=非模拟
-        return [pscustomobject]@{
-            Kind = 'full'; Number = $d[9]; Name = $name
-            TypeCode = $d[14]; ReadingType = $d[15]
-            Analog = $analog; Unit = $d[28]
-            Linearization = $d[29]
-            M = (ConvertTo-Signed10 $d[30] ($d[31] -band 3))
-            B = (ConvertTo-Signed10 $d[32] ($d[33] -band 3))
-            Rexp = (ConvertTo-SignedNibble ($d[36] -shr 4)); Bexp = (ConvertTo-SignedNibble ($d[36] -band 0xF))
-            NextId = $nextId }
     }
-    if ($recType -eq 0x02) {                                   # Compact Sensor Record
-        $name = Get-NameFromTail $d 7 $recEnd
-        if (-not $name) { $name = "Sensor#$($d[9])" }
-        return [pscustomobject]@{
-            Kind = 'compact'; Number = $d[9]; Name = $name
-            TypeCode = $d[14]; ReadingType = $d[15]
-            Analog = 3; Unit = 0
-            M = 1; B = 0; Rexp = 0; Bexp = 0; Linearization = 0
-            NextId = $nextId }
+    if (-not $name) { return $null }
+    $m = [int]($d[24] -bor ($d[25] -shl 8))
+    $b = [int]($d[26] -bor ($d[27] -shl 8))
+    return [pscustomobject]@{
+        Number  = [int]$d[9]
+        Name    = $name
+        TypeCode = [int]$d[14]          # 0x01温度 0x02电压 0x04风扇 ...
+        ReadingType = [int]$d[15]       # 0x01模拟量 0x6F离散量
+        Unit    = [int]$d[21]
+        M = $m; B = $b
+        Rexp = (ConvertTo-SignedNibble ($d[29] -shr 4)); Bexp = (ConvertTo-SignedNibble ($d[29] -band 0xF))
     }
-    return [pscustomobject]@{ Kind = 'other'; NextId = $nextId }   # 非传感器记录, 跳过
 }
 
-# 读取一个传感器的当前值, 返回 { Raw, Valid }
-function Read-Sensor {
-    param([byte]$Number)
-    $r = Invoke-IpmiRaw 0x04 0x2D @($Number)               # Get Sensor Reading
-    if ($r.CompletionCode -ne 0 -or $r.Data.Length -lt 1) { return $null }
-    $valid = $true
-    if ($r.Data.Length -ge 2) {
-        if (($r.Data[1] -band 0x40) -or ($r.Data[1] -band 0x80)) { $valid = $false }  # 扫描关/忙
-    }
-    return [pscustomobject]@{ Raw = [int]$r.Data[0]; Valid = $valid }
+# 读取一个传感器的当前原始值; 无读数返回 $null (flags 字节不可信, 忽略)
+function Read-SensorRaw {
+    param([int]$Number)
+    $r = Invoke-IpmiRaw 0x04 0x2D @([byte]$Number)
+    if ($r.CompletionCode -ne 0 -or $r.Data.Count -lt 1) { return $null }
+    return [int]$r.Data[0]
 }
 
-# 原始字节 → 工程值: y = (M*x + B*10^Bexp) * 10^Rexp
 function Convert-Reading {
     param($Sensor, [int]$Raw)
-    if ($Sensor.Analog -eq 3) { return $null }
-    if ($Sensor.Linearization -ne 0 -and $Sensor.Linearization -ne 0x70) { return $null }  # 非线性, 不换算
+    if ($Sensor.ReadingType -ne 0x01) { return $null }   # 离散量不做工程值换算
     $y = ($Sensor.M * [double]$Raw + $Sensor.B * [math]::Pow(10, $Sensor.Bexp)) * [math]::Pow(10, $Sensor.Rexp)
-    return [math]::Round($y, 1)
+    return [math]::Round($y, 2)
 }
 
-function Get-UnitName { param([byte]$Unit)
+function Get-UnitName { param([int]$Unit)
     switch ($Unit) {
-        1  { 'C' }   2  { 'F' }   18 { 'RPM' }  6  { 'V' }  5  { 'W' }
-        7  { 'A' }   20 { 'Hz' }  default { "U$Unit" }
+        1     { '°C' }  2 { '°F' }  4 { 'V' }  5 { 'W' }  6 { 'A' }
+        0x12  { 'RPM' } 0x10 { 'm' }  default { "u$Unit" }
     }
 }
 
+# 全量枚举: 等差步长扫描 0x0004 + k*0x43
+function Get-AllSensors {
+    Update-SdrReservation
+    $sensors = @()
+    foreach ($k in 0..64) {
+        $d = Read-SdrById (4 + 0x43 * $k)
+        if ($null -eq $d) { continue }
+        $p = Parse-SensorRecord $d
+        if ($p) { $sensors += $p }
+    }
+    return $sensors
+}
+
 # ============================================================
-# 三、status: 枚举全部传感器并分组显示
+# 三、status
 # ============================================================
 function Invoke-Status {
-    $devid = Invoke-IpmiRaw 0x06 0x01                      # 无害的握手命令
-    if ($devid.CompletionCode -ne 0) { throw ("GetDeviceID 失败 CC=0x{0:X2}" -f $devid.CompletionCode) }
-    $bmcFw = try { '{0}.{1}' -f $devid.Data[3].ToString('D'), $devid.Data[2].ToString('D') } catch { '?' }
-
-    # 查询风扇模式 (OEM 命令 0x30 0x45, 只查不改)
     $modeName = '未知'
     try {
         $m = Invoke-IpmiRaw 0x30 0x45 @([byte]0x00)
-        if ($m.CompletionCode -eq 0 -and $m.Data.Length -ge 1) {
+        if ($m.CompletionCode -eq 0 -and $m.Data.Count -ge 1) {
             $modeName = switch ($m.Data[0]) {
-                0 { 'Standard (BMC 自动)' } 1 { 'Full (全速)' } 2 { 'Optimal (最优)' }
+                0 { 'Standard (BMC 自动调速)' } 1 { 'Full (全速!)' } 2 { 'Optimal (最优)' }
                 3 { 'Heavy IO' } default { "代码 $($_)" }
             }
         }
-    } catch { $modeName = '查询失败(不影响)' }
+    } catch { $modeName = '查询失败' }
 
     Write-Host ''
-    Write-Host '======== Fan Butler v0 (只读) ========' (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-    Write-Host ("BMC 固件: {0}    风扇模式: {1}" -f $bmcFw, $modeName)
-    Write-Host '-------------------------------------'
+    Write-Host '======== Fan Butler v0.9 (只读) ========' (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+    Write-Host ("风扇模式: {0}" -f $modeName)
+    Write-Host '---------------------------------------'
 
-    # 枚举 SDR 仓库
-    $resRef = [ref](Get-SdrReservation)
-    $id = 0; $found = @(); $guard = 0
-    while ($guard -lt 400) {
-        $guard++
-        $rec = Read-SdrRecord $resRef $id
-        if (-not $rec) { break }
-        $p = Parse-SensorRecord $rec
-        if (-not $p) { break }
-        if ($p.Kind -ne 'other') { $found += $p }
-        if ($p.NextId -eq 0xFFFF -or $p.NextId -eq 0) { break }
-        $id = $p.NextId
+    $sensors = Get-AllSensors
+    $rows = foreach ($s in $sensors) {
+        $raw = Read-SensorRaw $s.Number
+        $val = if ($null -ne $raw) { Convert-Reading $s $raw } else { $null }
+        [pscustomobject]@{ Name = $s.Name; TypeCode = $s.TypeCode; Unit = (Get-UnitName $s.Unit)
+                           Value = $val; Raw = $raw }
     }
 
-    # 逐个读值
-    $rows = foreach ($s in $found) {
-        $rd = Read-Sensor ([byte]$s.Number)
-        $val = $null; $unit = Get-UnitName $s.Unit
-        if ($rd -and $rd.Valid) { $val = Convert-Reading $s $rd.Raw }
-        [pscustomobject]@{ Name = $s.Name; TypeCode = $s.TypeCode; Kind = $s.Kind
-                           Value = $val; Unit = $unit; Raw = $rd.Raw; Valid = ($rd -and $rd.Valid) }
-    }
-
-    # 分组显示
     $fans  = @($rows | Where-Object TypeCode -eq 0x04)
     $temps = @($rows | Where-Object TypeCode -eq 0x01)
-    $other = @($rows | Where-Object { $_.TypeCode -ne 0x04 -and $_.TypeCode -ne 0x01 })
+    $volts = @($rows | Where-Object TypeCode -eq 0x02)
+    $other = @($rows | Where-Object { $_.TypeCode -ne 0x04 -and $_.TypeCode -ne 0x01 -and $_.TypeCode -ne 0x02 })
 
-    Write-Host ("`n[风扇] 共 {0} 个传感器" -f $fans.Count)
-    foreach ($f in $fans) {
-        $line = '  {0,-18}' -f $f.Name
-        if ($f.Valid -and $null -ne $f.Value) { $line += ('{0,8} {1}' -f $f.Value, $f.Unit) }
-        elseif ($f.Valid) { $line += ('  在位 (离散值 0x{0:X2})' -f $f.Raw) }
-        else { $line += '  — (无读数)' }
-        Write-Host $line
+    Write-Host ("`n[风扇] {0} 个传感器" -f $fans.Count)
+    foreach ($f in ($fans | Sort-Object Name)) {
+        if ($null -ne $f.Value)      { Write-Host ('  {0,-10} {1,8} {2}' -f $f.Name, [int]$f.Value, $f.Unit) }
+        elseif ($null -ne $f.Raw)    { Write-Host ('  {0,-10} {1,8} (原始值, 未换算)' -f $f.Name, $f.Raw) }
+        else                         { Write-Host ('  {0,-10}   无风扇/无读数' -f $f.Name) }
     }
 
-    Write-Host ("`n[温度] 共 {0} 个传感器" -f $temps.Count)
-    foreach ($t in ($temps | Where-Object { $_.Name -notmatch 'DIMM' })) {
-        $line = '  {0,-18}' -f $t.Name
-        if ($t.Valid -and $null -ne $t.Value) { $line += ('{0,8} {1}' -f $t.Value, $t.Unit) }
-        elseif ($t.Valid) { $line += ('  离散值 0x{0:X2}' -f $t.Raw) }
-        else { $line += '  —' }
-        Write-Host $line
-    }
-    $dimm = @($temps | Where-Object { $_.Name -match 'DIMM' -and $null -ne $_.Value })
-    if ($dimm.Count -gt 0) {
-        $max = $dimm | Sort-Object Value -Descending | Select-Object -First 1
-        Write-Host ('  {0,-18}{1,8} C   (DIMM 共 {2} 条有读数, 最高: {3})' -f 'DIMM 汇总', $max.Value, $dimm.Count, $max.Name)
+    Write-Host ("`n[温度] {0} 个传感器" -f $temps.Count)
+    foreach ($t in ($temps | Sort-Object Name)) {
+        if ($null -ne $t.Value)      { Write-Host ('  {0,-18} {1,6} {2}' -f $t.Name, [int]$t.Value, $t.Unit) }
+        elseif ($null -ne $t.Raw)    { Write-Host ('  {0,-18} {1,6} (原始值)' -f $t.Name, $t.Raw) }
+        else                         { Write-Host ('  {0,-18}   无读数' -f $t.Name) }
     }
 
-    Write-Host ("`n[其他] 电压/电流等 {0} 个传感器 (完整清单见 fan-status.txt)" -f $other.Count)
+    Write-Host ("`n[电压] {0} 个传感器 (节选前 10)" -f $volts.Count)
+    foreach ($v in ($volts | Sort-Object Name | Select-Object -First 10)) {
+        if ($null -ne $v.Value)      { Write-Host ('  {0,-10} {1,8} {2}' -f $v.Name, $v.Value, $v.Unit) }
+    }
 
-    # 完整清单落盘, 便于排查
-    $rows | ForEach-Object { '{0,-20} type=0x{1:X2} {2,-10} raw={3}' -f $_.Name, $_.TypeCode, $(if ($null -ne $_.Value) { "$($_.Value) $($_.Unit)" } else { '-' }), $_.Raw } |
-        Set-Content -Encoding utf8 (Join-Path $PSScriptRoot 'fan-status.txt')
-    Write-Host "`n完整传感器清单已保存: fan-status.txt"
+    if ($other.Count -gt 0) {
+        Write-Host ("`n[其他] {0} 个 (VBAT/机箱侵入等)" -f $other.Count)
+        foreach ($o in $other) { Write-Host ('  {0,-12} 原始值 {1}' -f $o.Name, $o.Raw) }
+    }
+
+    # 完整清单落盘
+    $rows | ForEach-Object {
+        '{0,-18} type=0x{1:X2} {2,-12} raw={3}' -f $_.Name, $_.TypeCode, $(if ($null -ne $_.Value) { "$($_.Value) $($_.Unit)" } else { '-' }), $_.Raw
+    } | Set-Content -Encoding utf8 (Join-Path $PSScriptRoot 'fan-status.txt')
+    Write-Host "`n完整清单已保存: fan-status.txt"
 }
 
 # ============================================================
@@ -349,8 +232,9 @@ try {
     switch ($Command.ToLower()) {
         'status' { Invoke-Status }
         default {
-            Write-Host 'Fan Butler v0 (只读版)'
+            Write-Host 'Fan Butler v0.9 (只读版)'
             Write-Host '用法: pwsh -NoProfile -File fan.ps1 [status]'
+            Write-Host '(写操作 set/mode/restore 将在 v1 提供)'
         }
     }
 } catch {
