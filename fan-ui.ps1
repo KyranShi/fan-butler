@@ -192,6 +192,12 @@ $xamlText = @'
 
 $win = [Windows.Markup.XamlReader]::Parse($xamlText)
 
+# 窗口图标 (make-icon.ps1 生成的风扇图标)
+$icoPath = Join-Path $PSScriptRoot 'assets\fan.ico'
+if (Test-Path $icoPath) {
+    try { $win.Icon = [Windows.Media.Imaging.BitmapFrame]::Create([Uri]$icoPath) } catch { }
+}
+
 # ---- 调色板 ----
 $PillGreen = @{ Fg='#047857'; Bg='#E7F6EC'; Bd='#BFE6CC' }
 $PillBlue  = @{ Fg='#1D4ED8'; Bg='#E8EFFD'; Bd='#BFD3F6' }
