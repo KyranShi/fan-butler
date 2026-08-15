@@ -240,6 +240,13 @@ function Invoke-Mode {
     Show-FanSnapshot '当前风扇/温度'
 }
 
+# 在位风扇平均原始转速 (用于验证转速命令是否生效)
+function Get-FanAvgRaw {
+    $vals = @(Get-FanSnapshot | Where-Object { $_.TypeCode -eq 0x04 -and $null -ne $_.Raw -and $_.Raw -gt 0 } | ForEach-Object { $_.Raw })
+    if ($vals.Count -eq 0) { return $null }
+    return [math]::Round(($vals | Measure-Object -Average).Average, 1)
+}
+
 function Invoke-Set {
     param([string]$ZoneName, [string]$PctStr)
     $zoneMap = @{ 'cpu' = 0x00; 'periph' = 0x01; 'peripheral' = 0x01; 'pch' = 0x01 }
@@ -265,11 +272,25 @@ function Invoke-Set {
         Write-Host '等待 BMC 完成模式切换 (15 秒)...'
         Start-Sleep -Seconds 15
     }
+    # 发送 + 验证 + 重试 (实测这台 BMC 会偶发静默丢弃转速命令)
+    $before = Get-FanAvgRaw
     Write-Host ('> raw 0x30 0x70 0x66 0x01 0x{0:X2} 0x{1:X2}   ({2} 区转速 → {3}%)' -f $zone, $pct, $key, $pct)
     $r = Invoke-IpmiRaw 0x30 0x70 0x66 0x01 @([byte]$zone, [byte]$pct)
     if ($r.CompletionCode -ne 0) { throw ("设置转速失败 CC=0x{0:X2}" -f $r.CompletionCode) }
-    Write-Host 'OK, 指令已接受, 等待风扇跟进...'
-    Start-Sleep -Seconds 6
+    $after = $null; $ok = $false
+    for ($try = 1; $try -le 3; $try++) {
+        Start-Sleep -Seconds 6
+        $after = Get-FanAvgRaw
+        if ($null -eq $after -or $null -eq $before) { $ok = $true; break }              # 无法测量则不判失败
+        if ($after -le ($before * 0.85))               { $ok = $true; break }           # 转速确实降了
+        if ([math]::Abs($after - $before) -le ($before * 0.2)) { $ok = $true; break }   # 已在目标附近
+        if ($try -lt 3) {
+            Write-Host ("转速未见变化 (原始值 {0} → {1}), 重发指令 (第 {2} 次)..." -f $before, $after, ($try + 1))
+            [void](Invoke-IpmiRaw 0x30 0x70 0x66 0x01 @([byte]$zone, [byte]$pct))
+        }
+    }
+    if ($ok) { Write-Host ("OK, 转速原始值 {0} → {1} (占空比 {2}%)" -f $before, $after, $pct) }
+    else     { Write-Host ("警告: 重试后转速仍为原始值 {0}, 请用 status 复查" -f $after) }
     Show-FanSnapshot '当前风扇/温度 (手动模式; 恢复自动: fan.ps1 restore)'
 }
 
