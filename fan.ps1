@@ -35,7 +35,11 @@ Fan Butler — 超微主板风扇管家 (v0.9: 只读版, 已实测校准)
 
 v0.9 只读不写, 不会改变风扇任何状态。
 #>
-param([string]$Command = 'status')
+param(
+    [string]$Command = 'status',
+    [string]$Arg1,
+    [string]$Arg2
+)
 $ErrorActionPreference = 'Stop'
 
 # ============================================================
@@ -148,8 +152,10 @@ function Get-UnitName { param([int]$Unit)
     }
 }
 
-# 全量枚举: 等差步长扫描 0x0004 + k*0x43
+# 全量枚举: 等差步长扫描 0x0004 + k*0x43 (进程内缓存, 避免每次重复枚举)
+$script:SensorCache = $null
 function Get-AllSensors {
+    if ($script:SensorCache) { return $script:SensorCache }
     Update-SdrReservation
     $sensors = @()
     foreach ($k in 0..64) {
@@ -158,11 +164,115 @@ function Get-AllSensors {
         $p = Parse-SensorRecord $d
         if ($p) { $sensors += $p }
     }
+    $script:SensorCache = $sensors
     return $sensors
 }
 
+# 快照: 风扇 RPM + 关键温度 (用于命令执行后的即时验证)
+function Get-FanSnapshot {
+    $rows = foreach ($s in (Get-AllSensors)) {
+        if ($s.TypeCode -ne 0x04 -and $s.TypeCode -ne 0x01) { continue }
+        $raw = Read-SensorRaw $s.Number
+        $val = if ($null -ne $raw) { Convert-Reading $s $raw } else { $null }
+        [pscustomobject]@{ Name = $s.Name; TypeCode = $s.TypeCode; Value = $val; Raw = $raw }
+    }
+    return $rows
+}
+
+function Show-FanSnapshot {
+    param([string]$Title)
+    Write-Host ""
+    Write-Host "--- $Title ---"
+    foreach ($r in (Get-FanSnapshot)) {
+        if ($r.TypeCode -eq 0x04) {
+            if ($null -ne $r.Value)   { Write-Host ('  {0,-8} {1,6} RPM' -f $r.Name, [int]$r.Value) }
+            elseif ($null -ne $r.Raw) { Write-Host ('  {0,-8} {1,6} (原始值)' -f $r.Name, $r.Raw) }
+            else                      { Write-Host ('  {0,-8}    空位' -f $r.Name) }
+        } elseif ($r.Name -match '^(CPU1|CPU2|PCH|System|Peripheral) ') {
+            if ($null -ne $r.Value)   { Write-Host ('  {0,-16}{1,4} °C' -f $r.Name, [int]$r.Value) }
+        }
+    }
+}
+
 # ============================================================
-# 三、status
+# 三、写操作 (v1) — 每条命令执行前打印将发送的原始 IPMI 指令
+# ============================================================
+$ModeNames = @{ 0 = 'Standard (BMC 自动)'; 1 = 'Full (全速)'; 2 = 'Optimal (最优)'; 3 = 'Heavy IO' }
+
+function Get-FanModeCode {
+    $m = Invoke-IpmiRaw 0x30 0x45 @([byte]0x00)
+    if ($m.CompletionCode -ne 0 -or $m.Data.Count -lt 1) { return $null }
+    return [int]$m.Data[0]
+}
+
+function Set-FanMode {
+    param([int]$Code)
+    Write-Host ('> raw 0x30 0x45 0x00 0x{0:X2}   (设置风扇模式 → {1})' -f $Code, $ModeNames[$Code])
+    $r = Invoke-IpmiRaw 0x30 0x45 @([byte]0x00, [byte]$Code)
+    if ($r.CompletionCode -ne 0) { throw ("设置模式失败 CC=0x{0:X2}" -f $r.CompletionCode) }
+    Start-Sleep -Seconds 2
+    $now = Get-FanModeCode
+    if ($null -eq $now)      { Write-Host '已发送 (回读模式失败, 请用 status 查看)' }
+    elseif ($now -ne $Code)  { Write-Host ("警告: 回读模式为 {0}, 与目标不一致" -f $ModeNames[$now]) }
+    else                     { Write-Host ("OK, 模式已确认: {0}" -f $ModeNames[$now]) }
+}
+
+function Invoke-Mode {
+    param([string]$Name)
+    $map = @{ 'standard' = 0; 'full' = 1; 'optimal' = 2; 'heavy' = 3; 'heavyio' = 3 }
+    $key = if ($Name) { $Name.ToLower() } else { '' }
+    if (-not $map.ContainsKey($key)) {
+        Write-Host '用法: fan.ps1 mode standard|optimal|full|heavy'
+        Write-Host '  standard = 交还 BMC 自动控制 (最安全, 出厂默认)'
+        Write-Host '  optimal  = BMC 智能调速 (安静与散热的折中)'
+        Write-Host '  full     = 全速 (最吵, 散热最强)'
+        return
+    }
+    Set-FanMode $map[$key]
+    Start-Sleep -Seconds 3
+    Show-FanSnapshot '当前风扇/温度'
+}
+
+function Invoke-Set {
+    param([string]$ZoneName, [string]$PctStr)
+    $zoneMap = @{ 'cpu' = 0x00; 'periph' = 0x01; 'peripheral' = 0x01; 'pch' = 0x01 }
+    $key = if ($ZoneName) { $ZoneName.ToLower() } else { '' }
+    $pct = 0
+    if (-not $zoneMap.ContainsKey($key) -or -not [int]::TryParse($PctStr, [ref]$pct)) {
+        Write-Host '用法: fan.ps1 set cpu|periph <20-100>'
+        Write-Host '  cpu    = CPU/系统区风扇'
+        Write-Host '  periph = 外设区风扇'
+        Write-Host '  转速为占空比百分比, 出于安全已锁定 20-100'
+        return
+    }
+    if ($pct -lt 20) { Write-Host "下限保护: $pct% → 20% (更低会导致风扇停转)"; $pct = 20 }
+    if ($pct -gt 100) { Write-Host "上限保护: $pct% → 100%"; $pct = 100 }
+    $zone = $zoneMap[$key]
+
+    # 手动占空比只在 Full 模式下不被 BMC 覆盖, 先确认/切换
+    $cur = Get-FanModeCode
+    if ($cur -ne 1) {
+        if ($null -ne $cur) { Write-Host ("当前模式 {0}, 手动转速需要 Full 模式, 先切换..." -f $ModeNames[$cur]) }
+        Set-FanMode 1
+        Start-Sleep -Seconds 1
+    }
+    Write-Host ('> raw 0x30 0x70 0x66 0x01 0x{0:X2} 0x{1:X2}   ({2} 区转速 → {3}%)' -f $zone, $pct, $key, $pct)
+    $r = Invoke-IpmiRaw 0x30 0x70 0x66 0x01 @([byte]$zone, [byte]$pct)
+    if ($r.CompletionCode -ne 0) { throw ("设置转速失败 CC=0x{0:X2}" -f $r.CompletionCode) }
+    Write-Host 'OK, 指令已接受'
+    Start-Sleep -Seconds 4
+    Show-FanSnapshot '当前风扇/温度 (手动模式; 恢复自动: fan.ps1 restore)'
+}
+
+function Invoke-Restore {
+    Write-Host '一键恢复: 交还 BMC 自动控制 (standard 模式)'
+    Set-FanMode 0
+    Start-Sleep -Seconds 3
+    Show-FanSnapshot '当前风扇/温度'
+}
+
+# ============================================================
+# 四、status
 # ============================================================
 function Invoke-Status {
     $modeName = '未知'
@@ -230,11 +340,17 @@ function Invoke-Status {
 # ============================================================
 try {
     switch ($Command.ToLower()) {
-        'status' { Invoke-Status }
+        'status'  { Invoke-Status }
+        'mode'    { Invoke-Mode $Arg1 }
+        'set'     { Invoke-Set $Arg1 $Arg2 }
+        'restore' { Invoke-Restore }
         default {
-            Write-Host 'Fan Butler v0.9 (只读版)'
-            Write-Host '用法: pwsh -NoProfile -File fan.ps1 [status]'
-            Write-Host '(写操作 set/mode/restore 将在 v1 提供)'
+            Write-Host 'Fan Butler v1 (超微主板风扇管家)'
+            Write-Host '用法:'
+            Write-Host '  fan.ps1 status                     查看风扇/温度/电压'
+            Write-Host '  fan.ps1 mode standard|optimal|full 切换风扇模式'
+            Write-Host '  fan.ps1 set cpu|periph <20-100>    手动指定转速 (需 Full 模式, 自动切换)'
+            Write-Host '  fan.ps1 restore                    一键恢复 BMC 自动控制'
         }
     }
 } catch {
