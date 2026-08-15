@@ -201,8 +201,11 @@ function Show-FanSnapshot {
 #   设置模式: raw 0x30 0x45 0x01 <模式> ← 设置时第一数据字节是 0x01 (0x00 是查询,
 #             发 0x00 <模式> 会被"接受"但不执行 — 实测踩坑)
 #   手动转速: raw 0x30 0x70 0x66 0x01 <区> <百分比>
-#             仅在 Full 模式下生效; 且切到 Full 后需等 ~15 秒让 BMC 完成模式
-#             切换, 期间发送的转速命令会被静默丢弃 (实测踩坑)
+#             读回当前值: raw 0x30 0x70 0x66 0x00 <区>
+#             实测此固件 (BMC 3.1) 会"接受但不执行"占空比写入 (Standard/Optimal/Full
+#             模式下均如此, 用读回命令验证), 风扇转速实际由 BMC 自动曲线管理 —
+#             这也解释了当年"BMC 后台调速无效/回弹"的现象。程序保留此功能并
+#             如实报告验证结果, 供未来固件升级后使用。
 # ============================================================
 $ModeNames = @{ 0 = 'Standard (BMC 自动)'; 1 = 'Full (全速)'; 2 = 'Optimal (最优)'; 3 = 'Heavy IO' }
 
@@ -263,35 +266,34 @@ function Invoke-Set {
     if ($pct -gt 100) { Write-Host "上限保护: $pct% → 100%"; $pct = 100 }
     $zone = $zoneMap[$key]
 
-    # 手动占空比只在 Full 模式下生效; 且切换后必须等 BMC 完成模式切换 (~15 秒),
-    # 否则转速命令会被静默丢弃 (实测)
+    # 手动占空比: 不切换模式 (实测此固件切到 Full 会把转速钉死 100% 且拒绝手动值,
+    # 先切 Full 反而会让风扇咆哮; 在当前模式下直接尝试, 读回验证)
     $cur = Get-FanModeCode
-    if ($cur -ne 1) {
-        if ($null -ne $cur) { Write-Host ("当前模式 {0}, 手动转速需要 Full 模式, 先切换..." -f $ModeNames[$cur]) }
-        Set-FanMode 1
-        Write-Host '等待 BMC 完成模式切换 (15 秒)...'
-        Start-Sleep -Seconds 15
-    }
-    # 发送 + 验证 + 重试 (实测这台 BMC 会偶发静默丢弃转速命令)
+    if ($null -ne $cur) { Write-Host ("当前模式: {0} (保持不变)" -f $ModeNames[$cur]) }
+    # 发送 + 读回验证 + 重试 (实测: 此固件对占空比写入"接受但不执行",
+    # 用读回命令 0x30 0x70 0x66 0x00 <区> 精确判断是否真的生效)
     $before = Get-FanAvgRaw
     Write-Host ('> raw 0x30 0x70 0x66 0x01 0x{0:X2} 0x{1:X2}   ({2} 区转速 → {3}%)' -f $zone, $pct, $key, $pct)
-    $r = Invoke-IpmiRaw 0x30 0x70 0x66 0x01 @([byte]$zone, [byte]$pct)
-    if ($r.CompletionCode -ne 0) { throw ("设置转速失败 CC=0x{0:X2}" -f $r.CompletionCode) }
-    $after = $null; $ok = $false
+    $ok = $false; $readback = -1
     for ($try = 1; $try -le 3; $try++) {
-        Start-Sleep -Seconds 6
-        $after = Get-FanAvgRaw
-        if ($null -eq $after -or $null -eq $before) { $ok = $true; break }              # 无法测量则不判失败
-        if ($after -le ($before * 0.85))               { $ok = $true; break }           # 转速确实降了
-        if ([math]::Abs($after - $before) -le ($before * 0.2)) { $ok = $true; break }   # 已在目标附近
-        if ($try -lt 3) {
-            Write-Host ("转速未见变化 (原始值 {0} → {1}), 重发指令 (第 {2} 次)..." -f $before, $after, ($try + 1))
-            [void](Invoke-IpmiRaw 0x30 0x70 0x66 0x01 @([byte]$zone, [byte]$pct))
-        }
+        $r = Invoke-IpmiRaw 0x30 0x70 0x66 0x01 @([byte]$zone, [byte]$pct)
+        if ($r.CompletionCode -ne 0) { throw ("设置转速失败 CC=0x{0:X2}" -f $r.CompletionCode) }
+        Start-Sleep -Seconds 3
+        $g = Invoke-IpmiRaw 0x30 0x70 0x66 0x00 @([byte]$zone)
+        if ($g.CompletionCode -eq 0 -and $g.Data.Count -ge 1) { $readback = [int]$g.Data[0] }
+        if ($readback -eq $pct) { $ok = $true; break }
+        if ($try -lt 3) { Write-Host ("读回占空比 = {0}% (目标 {1}%), 重发..." -f $readback, $pct) }
     }
-    if ($ok) { Write-Host ("OK, 转速原始值 {0} → {1} (占空比 {2}%)" -f $before, $after, $pct) }
-    else     { Write-Host ("警告: 重试后转速仍为原始值 {0}, 请用 status 复查" -f $after) }
-    Show-FanSnapshot '当前风扇/温度 (手动模式; 恢复自动: fan.ps1 restore)'
+    if ($ok) {
+        Start-Sleep -Seconds 5
+        Write-Host ("OK, 占空比已生效 (读回 {0}%), 转速原始值 {1} → {2}" -f $readback, $before, (Get-FanAvgRaw))
+        Show-FanSnapshot '当前风扇/温度 (手动转速; 恢复自动: fan.ps1 restore)'
+    } else {
+        Write-Host ("结果: BMC 接受了命令但未执行 (读回仍为 {0}%)。" -f $readback)
+        Write-Host '实测此固件 (X12DAi-N6 BMC 3.1) 在 Standard/Optimal/Full 模式下均拒绝手动占空比,'
+        Write-Host '风扇转速由 BMC 自动曲线管理。想要安静请用:  fan.ps1 mode optimal'
+        Write-Host '(当前模式未做任何更改, 风扇状态未受影响)'
+    }
 }
 
 function Invoke-Restore {
@@ -379,7 +381,7 @@ try {
             Write-Host '用法:'
             Write-Host '  fan.ps1 status                     查看风扇/温度/电压'
             Write-Host '  fan.ps1 mode standard|optimal|full 切换风扇模式'
-            Write-Host '  fan.ps1 set cpu|periph <20-100>    手动指定转速 (需 Full 模式, 自动切换)'
+            Write-Host '  fan.ps1 set cpu|periph <20-100>    尝试手动指定转速 (固件可能拒绝, 如实报告)'
             Write-Host '  fan.ps1 restore                    一键恢复 BMC 自动控制'
         }
     }
