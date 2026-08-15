@@ -196,6 +196,13 @@ function Show-FanSnapshot {
 
 # ============================================================
 # 三、写操作 (v1) — 每条命令执行前打印将发送的原始 IPMI 指令
+# 实测要点 (X12DAi-N6 / BMC 3.1):
+#   查询模式: raw 0x30 0x45 0x00        → 返回 0/1/2/3
+#   设置模式: raw 0x30 0x45 0x01 <模式> ← 设置时第一数据字节是 0x01 (0x00 是查询,
+#             发 0x00 <模式> 会被"接受"但不执行 — 实测踩坑)
+#   手动转速: raw 0x30 0x70 0x66 0x01 <区> <百分比>
+#             仅在 Full 模式下生效; 且切到 Full 后需等 ~15 秒让 BMC 完成模式
+#             切换, 期间发送的转速命令会被静默丢弃 (实测踩坑)
 # ============================================================
 $ModeNames = @{ 0 = 'Standard (BMC 自动)'; 1 = 'Full (全速)'; 2 = 'Optimal (最优)'; 3 = 'Heavy IO' }
 
@@ -207,10 +214,10 @@ function Get-FanModeCode {
 
 function Set-FanMode {
     param([int]$Code)
-    Write-Host ('> raw 0x30 0x45 0x00 0x{0:X2}   (设置风扇模式 → {1})' -f $Code, $ModeNames[$Code])
-    $r = Invoke-IpmiRaw 0x30 0x45 @([byte]0x00, [byte]$Code)
+    Write-Host ('> raw 0x30 0x45 0x01 0x{0:X2}   (设置风扇模式 → {1})' -f $Code, $ModeNames[$Code])
+    $r = Invoke-IpmiRaw 0x30 0x45 @([byte]0x01, [byte]$Code)
     if ($r.CompletionCode -ne 0) { throw ("设置模式失败 CC=0x{0:X2}" -f $r.CompletionCode) }
-    Start-Sleep -Seconds 2
+    Start-Sleep -Seconds 3
     $now = Get-FanModeCode
     if ($null -eq $now)      { Write-Host '已发送 (回读模式失败, 请用 status 查看)' }
     elseif ($now -ne $Code)  { Write-Host ("警告: 回读模式为 {0}, 与目标不一致" -f $ModeNames[$now]) }
@@ -229,7 +236,7 @@ function Invoke-Mode {
         return
     }
     Set-FanMode $map[$key]
-    Start-Sleep -Seconds 3
+    Start-Sleep -Seconds 6
     Show-FanSnapshot '当前风扇/温度'
 }
 
@@ -249,18 +256,20 @@ function Invoke-Set {
     if ($pct -gt 100) { Write-Host "上限保护: $pct% → 100%"; $pct = 100 }
     $zone = $zoneMap[$key]
 
-    # 手动占空比只在 Full 模式下不被 BMC 覆盖, 先确认/切换
+    # 手动占空比只在 Full 模式下生效; 且切换后必须等 BMC 完成模式切换 (~15 秒),
+    # 否则转速命令会被静默丢弃 (实测)
     $cur = Get-FanModeCode
     if ($cur -ne 1) {
         if ($null -ne $cur) { Write-Host ("当前模式 {0}, 手动转速需要 Full 模式, 先切换..." -f $ModeNames[$cur]) }
         Set-FanMode 1
-        Start-Sleep -Seconds 1
+        Write-Host '等待 BMC 完成模式切换 (15 秒)...'
+        Start-Sleep -Seconds 15
     }
     Write-Host ('> raw 0x30 0x70 0x66 0x01 0x{0:X2} 0x{1:X2}   ({2} 区转速 → {3}%)' -f $zone, $pct, $key, $pct)
     $r = Invoke-IpmiRaw 0x30 0x70 0x66 0x01 @([byte]$zone, [byte]$pct)
     if ($r.CompletionCode -ne 0) { throw ("设置转速失败 CC=0x{0:X2}" -f $r.CompletionCode) }
-    Write-Host 'OK, 指令已接受'
-    Start-Sleep -Seconds 4
+    Write-Host 'OK, 指令已接受, 等待风扇跟进...'
+    Start-Sleep -Seconds 6
     Show-FanSnapshot '当前风扇/温度 (手动模式; 恢复自动: fan.ps1 restore)'
 }
 
@@ -287,7 +296,7 @@ function Invoke-Status {
     } catch { $modeName = '查询失败' }
 
     Write-Host ''
-    Write-Host '======== Fan Butler v0.9 (只读) ========' (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+    Write-Host '======== Fan Butler v1 ========' (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
     Write-Host ("风扇模式: {0}" -f $modeName)
     Write-Host '---------------------------------------'
 
