@@ -15,3 +15,5 @@ fanlord-main.py
 fanlord-readme.md
 sth-x12.txt
 ref-fancontrol-ui.png
+# 开发期诊断脚本 (本地保留, 不公开)
+diag*.ps1
