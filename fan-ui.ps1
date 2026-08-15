@@ -297,5 +297,16 @@ $script:timer.Add_Tick({ Invoke-Refresh })
 $script:timer.Start()
 
 $form.Add_Shown({ Invoke-Refresh })
+
+if (-not [Environment]::UserInteractive) {
+    # 无桌面会话 (服务会话0等): 不弹窗, 做两轮真实刷新自检后退出 — 用于自动化测试
+    Invoke-Refresh
+    Start-Sleep -Seconds 3
+    Invoke-Refresh
+    Write-Output ("SELFTEST mode=[{0}] duty=[{1}] FAN1=[{2}] CPU1=[{3}]" -f `
+        $lblMode.Text, $lblDuty.Text, $script:FanLabels['FAN1'].Text, $script:TempLabels['CPU1'].Text)
+    exit 0
+}
+
 [void]$form.ShowDialog()
 $form.Dispose()
