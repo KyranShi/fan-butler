@@ -1,67 +1,68 @@
-# Fan Butler — 超微主板风扇管家
+# Fan Butler — 风扇管家
 
-一台放在家里太吵的超微服务器 (X12DAi-N6)，终于安静了。
+超微 (Supermicro) 主板风扇管理工具 · Windows 原生 IPMI 通道 · **零依赖单文件**
 
-## 这是什么
+[English TL;DR](#english-tldr)
 
-一个单文件 PowerShell 脚本 (`fan.ps1`)，通过 **Windows 自带的 IPMI 驱动**直接和主板上的
-BMC 对话，查看风扇/温度/电压，并切换风扇工作模式。**不需要安装任何软件，不需要 BMC
-账号密码**，比原来 34MB 的 Fan-Lord（捆绑官方 IPMICFG）轻得多。
+## 它解决什么问题
 
-## 怎么用
+超微服务器的 BMC 把风扇策略锁死时（比如固定 Full 全速），机器像直升机一样吵。
+本工具通过 **Windows 系统自带的 IPMI 驱动**（WMI: `root\WMI\Microsoft_IPMI`）直接与 BMC 对话，
+查看全部传感器并切换风扇工作模式 —— 不需要装 ipmitool、不需要 IPMICFG、不需要 BMC 账号密码。
 
-**图形界面（推荐）**：双击桌面上的 **"风扇管家"** 快捷方式。窗口里可以：
-- 实时看到 8 个风扇位转速、CPU/PCH/系统温度、当前模式和占空比（每 5 秒自动刷新）
-- 一键切换：绿色 **[安静模式 Optimal]**（日常推荐）/ 蓝色 **[标准模式 Standard]**（出厂默认）/ 红色 **[全速模式 Full]**（会弹确认框）
-- 首次启动会弹 UAC 管理员授权（IPMI 接口需要），点"是"即可
+在 Supermicro X12DAi-N6 + 双 Xeon 8383C 上实测：**Full 全速 1540 RPM 咆哮 → Optimal 模式待机 420 RPM，温度全部安全**。
 
-**命令行版**（管理员 PowerShell 里）：
+## 使用
+
+需要：Windows + 管理员权限 + 设备管理器里有 "Microsoft Generic IPMI Compliant Device"（Windows 自带）。
+
+**图形界面（推荐）**：双击 `fan-ui.ps1`（或其快捷方式），WPF 浅色界面，实时转速/温度/模式，一键切换。
+
+**命令行**：
 
 ```powershell
-cd D:\dshworkpalce
-.\fan.ps1 status          # 查看风扇转速 / 温度 / 电压 / 当前模式
-.\fan.ps1 mode optimal    # 切到"最优"模式 —— 日常推荐, 安静且自动保护
-.\fan.ps1 mode standard   # 切回"标准"模式 (出厂默认)
-.\fan.ps1 mode full       # 全速 (最吵, 需要极致散热时用)
-.\fan.ps1 restore         # 一键恢复 = mode standard
-.\fan.ps1 set cpu 40      # 尝试手动转速 (本机固件会拒绝, 见下)
+.\fan.ps1 status          # 查看风扇/温度/电压/当前模式
+.\fan.ps1 mode optimal    # 切到智能调速 (日常推荐)
+.\fan.ps1 mode standard   # 出厂默认
+.\fan.ps1 mode full       # 全速 (吵)
+.\fan.ps1 set cpu 40      # 尝试手动转速 (是否生效取决于 BMC 固件, 见下)
 ```
 
-图形界面源码: `fan-ui.ps1` (PowerShell + 系统自带 WinForms, 同样零依赖)。
+`make-icon.ps1` 重新生成程序图标（GDI+ 矢量绘制 → 多尺寸 ICO）。
 
-## 效果实测 (2026-08)
+## 独家发现 (逆向 X12DAi-N6 / BMC 1.3 实测, 或对你有用)
 
-| 状态 | 风扇转速 | 噪音 |
-|------|---------|------|
-| 之前 (Full 全速模式) | 1540–2100 RPM | 咆哮 |
-| mode optimal / standard (待机温度) | **420 RPM (20% 占空比)** | 几乎无声 |
+网络上流传的超微风扇命令有几个坑，全部用真实硬件验证过：
 
-BMC 自动曲线会在负载/温度上升时自动提高转速 —— 比固定转速更安全
-(当年 Fan-Lord 的作者就是因为固定转速压不住游戏负载才写的 GUI)。
+1. **设置风扇模式的正确编码是 `raw 0x30 0x45 0x01 <模式>`**。
+   `0x00 <模式>` 是错误写法 —— BMC 会返回成功但**静默不执行**。
+   这大概率就是"BMC 网页/命令调了没效果、过会儿回弹"的真正原因。
+   （`0x30 0x45 0x00` 是查询；模式值：0=Standard 1=Full 2=Optimal 3=Heavy IO）
+2. **占空比读回命令 `raw 0x30 0x70 0x66 0x00 <区>` 是验证调速是否生效的可靠手段**。
+   写入 `0x30 0x70 0x66 0x01 <区> <百分比>` 即使返回 CC=0 也可能未执行——必须读回验证。
+   本机固件在 Standard/Optimal/Full 下均拒绝手动占空比（读回始终是 BMC 曲线值），
+   即固件较老时"模式切换"才是唯一有效杠杆；`set` 命令保留并在固件升级后可能直接可用。
+3. **Windows IPMI 驱动的响应格式**：`RequestResponse` 的 `ResponseData` 首字节是完成码回显，
+   真实 IPMI 负载从第 2 字节开始。
+4. **SDR 传感器仓库的怪癖**（此固件）：GetSDR 返回 `[nextId(2B)][记录]`；记录 ID 从 0x0004 起
+   等差 **+0x43** 排列（链表 next-id 高字节不可靠，按步长扫描最稳）；换算字段在记录的
+   [21]=单位 [26..27]=M [28..29]=B [31]=Rexp/Bexp（与规范有偏移，已用电压传感器反推验证）。
 
-## 重要发现 (为什么你的 BMC 后台调速总"回弹")
+诊断证据链在 `diag*.ps1`（12 个递进实验脚本），复现以上结论的原始数据均可回查。
 
-对这台机器逆向实测得出的固件行为 (BMC 3.1)：
+## 安全设计
 
-1. **设置模式的命令编码**：`raw 0x30 0x45 0x01 <模式>`。
-   网上流传的 `0x00 <模式>` 会被 BMC"接受"(返回成功)但**不执行** ——
-   这大概率就是你当年在 BMC 网页里调速失败/回弹的原因。
-2. **手动占空比被固件拒绝**：`raw 0x30 0x70 0x66 0x01 <区> <百分比>` 发下去
-   BMC 返回成功，但用读回命令 (`0x30 0x70 0x66 0x00 <区>`) 验证，在
-   Standard / Optimal / Full 三种模式下均未生效 —— 转速始终由 BMC 自动曲线管理。
-   脚本保留了 `set` 命令并做读回验证 + 如实报告，未来固件升级后可能直接可用。
-3. 因此**模式切换就是本机风扇控制的正确杠杆**，`mode optimal` 一条命令解决噪音。
+- 只读与模式切换分离；模式切换是 BMC 官方功能，随时可逆；
+- `set` 带 20% 转速下限 + 读回验证，被固件拒绝时如实报告且不改变任何状态；
+- 全速模式切换带二次确认；
+- 极端情况的终极恢复：`.\fan.ps1 mode standard` 或 BIOS 里恢复默认。
 
-## 项目文件
+## 致谢
 
-- `fan.ps1` —— 主程序 (唯一需要用的文件)
-- `diag*.ps1` —— 开发过程中的诊断/实验脚本 (逆向 BMC 行为的证据链，可删)
-- `fanlord-*.py/md`、`sth-x12.txt` —— 参考资料归档 (Fan-Lord 源码、论坛帖子)
-- `tools\IPMICFG-Win.exe` —— 官方工具备用件 (本项目不依赖它)
-- 历史版本用 git 管理，`git log` 可查每一步
+- [KCORES/fan-lord](https://github.com/kcores/fan-lord) 与 [cyberbus 的博客](https://cyberbus.net/post/129) —— 本项目的起点与命令参考；
+- [FanControl](https://github.com/Rem0o/FanControl.Releases) —— GUI 设计语言参考。
 
-## 安全说明
+## English TL;DR
 
-- `status` 只读；`mode` 只切换 BMC 官方支持的模式，随时可逆；
-- `set` 带 20% 下限保护，且被本固件拒绝时不会改变任何状态；
-- 极端情况下的"终极恢复"：进 BIOS 把 Fan Mode 改回默认，或 `.\fan.ps1 mode standard`。
+Fan management for Supermicro boards over the **native Windows IPMI driver** (zero dependencies, no ipmitool/IPMICFG/BMC credentials). CLI (`fan.ps1`) + WPF GUI (`fan-ui.ps1`).
+Verified findings on X12DAi-N6 / BMC 1.3: fan-mode set must use `raw 0x30 0x45 0x01 <mode>` (the widely-circulated `0x00 <mode>` encoding is silently ignored); duty writes must be verified via readback (`0x30 0x70 0x66 0x00 <zone>`) since this firmware accepts-but-ignores them in all modes; the Windows IPMI driver prefixes response data with an extra completion-code echo byte; SDR records live at IDs `0x0004 + k*0x43` with calibration fields at non-standard offsets (see `diag*.ps1` for the evidence chain).
